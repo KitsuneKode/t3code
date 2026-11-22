@@ -9,7 +9,6 @@ import { isShownUnderParent } from "@t3tools/client-runtime/state/threads";
 import type { AnyRouter } from "@tanstack/react-router";
 import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entities";
 import type { EnvironmentId, OrchestrationV2ThreadShell, ThreadId } from "@t3tools/contracts";
-import { monitorHoldsWakeCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import type { ClientSettings } from "@t3tools/contracts/settings";
 import * as Option from "effect/Option";
 import type { AtomRegistry } from "effect/reactivity";
@@ -38,6 +37,7 @@ import { resolveSidebarThreadStatus, type SidebarThreadStatus } from "./Sidebar.
 import {
   createThreadNotificationGate,
   isSnoozedForNotification,
+  resolveThreadCompletionObservation,
   type ThreadNotificationKind,
   type ThreadNotificationObservation,
 } from "./ThreadNotificationCoordinator.logic";
@@ -282,10 +282,12 @@ export function startThreadNotifications(
         : requestId !== null
           ? `${status}:${requestId}`
           : `${thread.latestRun?.runId ?? ""}:${status}`;
-      const completed = status === "ready" && thread.latestRun?.status === "completed";
-      const settled = completed && !monitorHoldsWakeCompletion(rawThread);
-      const parsedCompletedAt = Date.parse(thread.latestRun?.completedAt ?? "");
-      const completedAt = Number.isFinite(parsedCompletedAt) ? parsedCompletedAt : null;
+      const completion = resolveThreadCompletionObservation({
+        status,
+        latestRun: thread.latestRun,
+        pendingBackgroundTasks: thread.pendingBackgroundTasks,
+        rawThread,
+      });
       const state = {
         raw: rawThread,
         subagentRequest,
@@ -293,9 +295,7 @@ export function startThreadNotifications(
         status,
         attention,
         requestId,
-        settled,
-        completedAt: settled ? completedAt : null,
-        backgroundWake: rawThread.latestRunBackgroundWake === true,
+        ...completion,
       };
       next.set(thread.id, state);
       changed.push([prior, state]);

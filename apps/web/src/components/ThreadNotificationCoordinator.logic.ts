@@ -2,6 +2,11 @@ import {
   effectiveSnoozed,
   type ThreadSnoozeShell,
 } from "@t3tools/client-runtime/state/thread-settled";
+import type { OrchestrationV2ThreadShell } from "@t3tools/contracts";
+import {
+  backgroundWorkHoldsCompletion,
+  monitorHoldsWakeCompletion,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 export type ThreadNotificationKind = "input" | "completion";
 
@@ -14,12 +19,45 @@ export interface ThreadNotificationObservation {
   readonly settled: boolean;
   /** When the latest run completed, if it did. */
   readonly completedAt: number | null;
+  /** When the latest completed run finished while still held by background work or a monitor wake. */
+  readonly heldCompletionAt: number | null;
   /** The latest run answers a background-work progress wake, like a Monitor line. */
   readonly backgroundWake: boolean;
 }
 
-/** Matches the push relay's completion confirmation: a final wake can start right after a progress wake. */
+/** Matches the push relay's completion confirmation: a wake run can start right after background work releases a completion. */
 export const RELEASED_COMPLETION_GRACE_MS = 5_000;
+
+export function resolveThreadCompletionObservation(input: {
+  readonly status: string;
+  readonly latestRun: { readonly status: string; readonly completedAt: string | null } | null;
+  readonly pendingBackgroundTasks: NonNullable<
+    OrchestrationV2ThreadShell["pendingBackgroundTasks"]
+  >;
+  readonly rawThread: Pick<
+    OrchestrationV2ThreadShell,
+    "latestRunBackgroundWake" | "pendingBackgroundTasks"
+  >;
+}): Pick<
+  ThreadNotificationObservation,
+  "settled" | "completedAt" | "heldCompletionAt" | "backgroundWake"
+> {
+  const completed = input.status === "ready" && input.latestRun?.status === "completed";
+  const monitorHeld = monitorHoldsWakeCompletion(input.rawThread);
+  const settled = completed && !monitorHeld;
+  const parsedCompletedAt = Date.parse(input.latestRun?.completedAt ?? "");
+  const completedAt = Number.isFinite(parsedCompletedAt) ? parsedCompletedAt : null;
+  const heldCompletion =
+    !settled &&
+    input.latestRun?.status === "completed" &&
+    (backgroundWorkHoldsCompletion(input.pendingBackgroundTasks) || monitorHeld);
+  return {
+    settled,
+    completedAt: settled ? completedAt : null,
+    heldCompletionAt: heldCompletion ? completedAt : null,
+    backgroundWake: input.rawThread.latestRunBackgroundWake === true,
+  };
+}
 
 /**
  * Whether completion notifications are suppressed by snooze. A completion that landed
@@ -104,7 +142,7 @@ export function createThreadNotificationGate<Key>(
       }
       const at = next.completedAt;
       if (!next.settled || at === null || at <= (handled.get(key) ?? -Infinity)) return;
-      if (next.backgroundWake) {
+      if (next.backgroundWake || prior.heldCompletionAt === at) {
         release(key, at);
         return;
       }

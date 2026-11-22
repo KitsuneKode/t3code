@@ -1640,6 +1640,65 @@ describe("deriveThreadPendingBackgroundTasks", () => {
       ),
     ).toEqual([{ taskId: "task-1", kind: "background_task" }]);
   });
+
+  it("holds a finished claimed delegated subagent before its wake run starts, and drops it once the wake run is running", () => {
+    const taskId = "node-sub-1";
+    const wakeMessageId = "message-2";
+    const parentRun = {
+      ...run(1, "completed"),
+      delegatedCompletion: {
+        disposition: "open",
+        nextGeneration: 2,
+        delivery: { generation: 1, messageId: wakeMessageId, taskIds: [taskId] },
+      },
+    };
+    const subagent = {
+      id: taskId,
+      threadId: base.thread.id,
+      runId: parentRun.id,
+      parentNodeId: "node-root-1",
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: "claudeAgent",
+      providerInstanceId: base.thread.providerInstanceId,
+      providerThreadId: null,
+      childThreadId: "thread-child-1",
+      nativeTaskRef: null,
+      prompt: "Audit PR",
+      title: "Audit PR",
+      model: "claude-opus-5-5",
+      modelSelection: base.thread.modelSelection,
+      completionDelivery: { state: "claimed", observedByRunId: null },
+      status: "completed",
+      result: "Looks good",
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+    };
+    expect(
+      deriveThreadPendingBackgroundTasks(
+        projection({
+          runs: [parentRun],
+          subagents: [subagent],
+        }),
+      ),
+    ).toEqual([
+      {
+        taskId,
+        description: "Audit PR",
+        kind: "subagent",
+        childThreadId: "thread-child-1",
+      },
+    ]);
+    expect(
+      deriveThreadPendingBackgroundTasks(
+        projection({
+          runs: [parentRun, { ...run(2, "running"), userMessageId: wakeMessageId }],
+          subagents: [subagent],
+        }),
+      ),
+    ).toEqual([]);
+  });
 });
 
 describe("prepareRevertedMessageAttachments", () => {

@@ -4,6 +4,7 @@ import {
   createThreadNotificationGate,
   isSnoozedForNotification,
   RELEASED_COMPLETION_GRACE_MS,
+  resolveThreadCompletionObservation,
   type ThreadNotificationObservation,
 } from "./ThreadNotificationCoordinator.logic";
 
@@ -12,6 +13,7 @@ const working: ThreadNotificationObservation = {
   requestId: null,
   settled: false,
   completedAt: null,
+  heldCompletionAt: null,
   backgroundWake: false,
 };
 const completed = (at: number): ThreadNotificationObservation => ({
@@ -19,12 +21,17 @@ const completed = (at: number): ThreadNotificationObservation => ({
   requestId: null,
   settled: true,
   completedAt: at,
+  heldCompletionAt: null,
   backgroundWake: false,
 });
 const waking: ThreadNotificationObservation = { ...working, backgroundWake: true };
 const woke = (at: number): ThreadNotificationObservation => ({
   ...completed(at),
   backgroundWake: true,
+});
+const held = (at: number): ThreadNotificationObservation => ({
+  ...working,
+  heldCompletionAt: at,
 });
 const visible = { archived: false, quiet: false, snoozed: false };
 const snoozed = { ...visible, snoozed: true };
@@ -216,6 +223,41 @@ describe("createThreadNotificationGate", () => {
       expect(notify).not.toHaveBeenCalled();
     }
   });
+
+  it("waits out the grace when a completion previously held by background work is released, and a wake run replaces it", () => {
+    using _timers = fakeTimers();
+    const { notify, observe } = harness();
+    observe(working);
+    observe(held(1));
+    // Background task roster drains right before the wake run starts; run 1 was not a background wake.
+    observe(completed(1));
+    expect(notify).not.toHaveBeenCalled();
+    observe(working);
+    vi.advanceTimersByTime(RELEASED_COMPLETION_GRACE_MS);
+    expect(notify).not.toHaveBeenCalled();
+    observe(completed(2));
+    expect(notify.mock.calls).toEqual([["thread", "completion"]]);
+  });
+
+  it("notifies once after the grace when a released completion has no following wake, and immediately when a newer run finished", () => {
+    using _timers = fakeTimers();
+    const { notify, observe } = harness();
+    observe(held(1));
+    observe(completed(1));
+    expect(notify).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(RELEASED_COMPLETION_GRACE_MS - 1);
+    expect(notify).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(notify.mock.calls).toEqual([["thread", "completion"]]);
+
+    // Jumping across a reconnect from a held older run directly to a newer completed run notifies immediately.
+    observe(held(2));
+    observe(completed(3));
+    expect(notify.mock.calls).toEqual([
+      ["thread", "completion"],
+      ["thread", "completion"],
+    ]);
+  });
 });
 
 describe("isSnoozedForNotification", () => {
@@ -242,5 +284,67 @@ describe("isSnoozedForNotification", () => {
     ],
   ])("a completion %s is suppressed: %s", (_name, shell, completedAt, now, expected) => {
     expect(isSnoozedForNotification(shell, completedAt, now)).toBe(expected);
+  });
+});
+
+describe("resolveThreadCompletionObservation", () => {
+  const atIso = "2026-09-13T07:00:01.000Z";
+  const atMs = Date.parse(atIso);
+  const subagent = [{ taskId: "sub-1", kind: "subagent" as const }];
+  const monitor = [{ taskId: "mon-1", kind: "monitor" as const }];
+
+  it.each([
+    [
+      "completed run held by a background subagent",
+      {
+        status: "waiting",
+        latestRun: { status: "completed", completedAt: atIso },
+        pendingBackgroundTasks: subagent,
+        rawThread: { latestRunBackgroundWake: false, pendingBackgroundTasks: subagent },
+      },
+      { settled: false, completedAt: null, heldCompletionAt: atMs, backgroundWake: false },
+    ],
+    [
+      "completed run held by a subagent even while an approval needs attention",
+      {
+        status: "approval",
+        latestRun: { status: "completed", completedAt: atIso },
+        pendingBackgroundTasks: subagent,
+        rawThread: { latestRunBackgroundWake: false, pendingBackgroundTasks: subagent },
+      },
+      { settled: false, completedAt: null, heldCompletionAt: atMs, backgroundWake: false },
+    ],
+    [
+      "completed progress wake held by its monitor",
+      {
+        status: "ready",
+        latestRun: { status: "completed", completedAt: atIso },
+        pendingBackgroundTasks: monitor,
+        rawThread: { latestRunBackgroundWake: true, pendingBackgroundTasks: monitor },
+      },
+      { settled: false, completedAt: null, heldCompletionAt: atMs, backgroundWake: true },
+    ],
+    [
+      "settled completion after background work clears",
+      {
+        status: "ready",
+        latestRun: { status: "completed", completedAt: atIso },
+        pendingBackgroundTasks: [],
+        rawThread: { latestRunBackgroundWake: false, pendingBackgroundTasks: [] },
+      },
+      { settled: true, completedAt: atMs, heldCompletionAt: null, backgroundWake: false },
+    ],
+    [
+      "active run waiting on t3_thread_wait is not a held completion",
+      {
+        status: "waiting",
+        latestRun: { status: "running", completedAt: null },
+        pendingBackgroundTasks: [],
+        rawThread: { latestRunBackgroundWake: false, pendingBackgroundTasks: [] },
+      },
+      { settled: false, completedAt: null, heldCompletionAt: null, backgroundWake: false },
+    ],
+  ])("derives completion fields for %s", (_name, input, expected) => {
+    expect(resolveThreadCompletionObservation(input)).toEqual(expected);
   });
 });
